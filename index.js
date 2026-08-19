@@ -103,12 +103,52 @@ app.post('/auth/register_key', async (req, res) => {
     }
 
     const { publicKey } = req.body;
-    if (!publicKey) return res.status(400).json({ error: 'publicKey is required' });
+    
+    let finalPublicKey = publicKey;
+    
+    // If client sends FALLBACK_REQUEST (Web Crypto not available), generate key pair on server
+    if (!publicKey || publicKey === 'FALLBACK_REQUEST') {
+      log('WARNING', '/auth/register_key', `Client cannot generate keys (no Web Crypto), generating server-side for user ${user.id}`);
+      
+      try {
+        // Generate RSA key pair on server side for fallback clients
+        const { publicKey: serverPubKey, privateKey: serverPrivKey } = crypto.generateKeyPairSync('rsa', {
+          modulusLength: 2048,
+          publicKeyEncoding: { type: 'spki', format: 'pem' },
+          privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+        });
+        
+        finalPublicKey = serverPubKey;
+        
+        // Store both keys since client cannot generate them
+        const { error: upsertError } = await supabase
+          .from('user_keys')
+          .upsert(
+            { user_id: user.id, public_key: serverPubKey, private_key: serverPrivKey },
+            { onConflict: 'user_id' }
+          );
+
+        if (upsertError) {
+          log('ERROR', '/auth/register_key', `Supabase DB Error: ${upsertError.message}`);
+          return res.status(500).json({ error: 'Failed to save key: ' + upsertError.message });
+        }
+
+        log('INFO', '/auth/register_key', `Server-generated key pair registered for user ${user.id}`);
+        return res.json({ success: true, serverGenerated: true, privateKey: serverPrivKey });
+        
+      } catch (genError) {
+        log('ERROR', '/auth/register_key', `Failed to generate key pair: ${genError.message}`);
+        return res.status(500).json({ error: 'Failed to generate key pair' });
+      }
+    }
+    
+    // Normal flow: client provided public key
+    if (!finalPublicKey) return res.status(400).json({ error: 'publicKey is required' });
 
     const { error: upsertError } = await supabase
       .from('user_keys')
       .upsert(
-        { user_id: user.id, public_key: publicKey, private_key: 'N/A_CLIENT_ONLY' },
+        { user_id: user.id, public_key: finalPublicKey, private_key: 'N/A_CLIENT_ONLY' },
         { onConflict: 'user_id' }
       );
 
