@@ -125,7 +125,7 @@ app.post('/auth/register_key', async (req, res) => {
           .from('user_keys')
           .upsert(
             { user_id: user.id, public_key: serverPubKey, private_key: serverPrivKey },
-            { onConflict: 'user_id' }
+            { onConflict: 'user_id', ignoreDuplicates: false }
           );
 
         if (upsertError) {
@@ -145,11 +145,12 @@ app.post('/auth/register_key', async (req, res) => {
     // Normal flow: client provided public key
     if (!finalPublicKey) return res.status(400).json({ error: 'publicKey is required' });
 
+    // Use upsert to handle both insert and update cases
     const { error: upsertError } = await supabase
       .from('user_keys')
       .upsert(
         { user_id: user.id, public_key: finalPublicKey, private_key: 'N/A_CLIENT_ONLY' },
-        { onConflict: 'user_id' }
+        { onConflict: 'user_id', ignoreDuplicates: false }
       );
 
     if (upsertError) {
@@ -185,6 +186,48 @@ app.post('/auth/verify', async (req, res) => {
   } catch (error) {
     log('ERROR', '/auth/verify', `Internal error: ${error.stack}`);
     res.status(500).json({ valid: false });
+  }
+});
+
+// ---- Auth: Check Key Registration Status ----
+app.post('/auth/check_key', async (req, res) => {
+  log('INFO', '/auth/check_key', 'Checking key registration status');
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing token' });
+
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+
+    if (authError || !user) {
+      log('WARNING', '/auth/check_key', 'Invalid session');
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+
+    const { data: keyData, error: keyError } = await supabase
+      .from('user_keys')
+      .select('public_key, private_key')
+      .eq('user_id', user.id)
+      .single();
+
+    if (keyError && keyError.code !== 'PGRST116') {
+      log('ERROR', '/auth/check_key', `Supabase error: ${keyError.message}`);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    const hasKey = !!keyData?.public_key;
+    const isServerGenerated = hasKey && keyData.private_key !== 'N/A_CLIENT_ONLY';
+
+    log('INFO', '/auth/check_key', `User ${user.id} - hasKey: ${hasKey}, serverGenerated: ${isServerGenerated}`);
+    
+    res.json({ 
+      hasKey, 
+      isServerGenerated,
+      privateKey: isServerGenerated ? keyData.private_key : null
+    });
+  } catch (error) {
+    log('ERROR', '/auth/check_key', `Internal error: ${error.stack}`);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -227,8 +270,12 @@ app.post('/gateway', async (req, res) => {
       .single();
 
     if (keyError || !keyData?.public_key) {
-      log('WARNING', '/gateway', `Public key not found for user ${user.id}`);
-      return res.status(400).json({ error: 'Public key not registered. Please re-login.' });
+      log('WARNING', '/gateway', `Public key not found for user ${user.id} - keyError: ${keyError?.code}`);
+      return res.status(403).json({ 
+        error: 'Public key not registered', 
+        code: 'KEY_NOT_REGISTERED',
+        message: 'Kunci keamanan belum terdaftar. Silakan logout dan login kembali untuk mendaftarkan kunci baru.'
+      });
     }
 
     // 3. Verify digital signature of the encrypted payload
