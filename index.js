@@ -236,7 +236,7 @@ app.post('/gateway', async (req, res) => {
   log('INFO', '/gateway', 'Incoming gateway request');
   try {
     const authHeader = req.headers.authorization;
-    const { encryptedPayload, signature } = req.body;
+    const { payload: encryptedPayload, sig: signature } = req.body;
 
     // Debug: Log what we actually received
     log('INFO', '/gateway', `Auth header present: ${!!authHeader}`);
@@ -247,8 +247,8 @@ app.post('/gateway', async (req, res) => {
     if (!authHeader || !encryptedPayload || !signature) {
       const missing = [];
       if (!authHeader) missing.push('authHeader');
-      if (!encryptedPayload) missing.push('encryptedPayload');
-      if (!signature) missing.push('signature');
+      if (!encryptedPayload) missing.push('payload');
+      if (!signature) missing.push('sig');
       log('WARNING', '/gateway', `Missing fields: ${missing.join(', ')}`);
       return res.status(400).json({ error: `Bad Request: missing ${missing.join(', ')}` });
     }
