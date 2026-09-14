@@ -25,43 +25,84 @@ const log = (level, action, message) => {
   console[fn](`[${ts}] [${level}] [${action}] ${message}`);
 };
 
-// AES-256-GCM key derivation (PBKDF2) - must match client crypto.js
-const PBKDF2_SALT = Buffer.from('ext-secure-aes-salt-v1');
-const PBKDF2_ITERATIONS = 100000;
+// ============================================================
+// CRYPTO v3 — Matches client crypto.js exactly
+// Protocol: HKDF-SHA-384 + AES-256-GCM + RSA-PSS-4096/SHA-512
+// ============================================================
 
-const deriveKey = (sessionToken) => {
-  return crypto.pbkdf2Sync(sessionToken, PBKDF2_SALT, PBKDF2_ITERATIONS, 32, 'sha256');
+const HKDF_INFO_REQUEST  = Buffer.from('ext-request-v3');
+const HKDF_INFO_RESPONSE = Buffer.from('ext-response-v3');
+
+/**
+ * Compute IKM = deviceKey XOR sessionToken (32 bytes)
+ * Matches client: for (let i = 0; i < 32; i++) ikm[i] = (deviceBytes[i] ?? 0) ^ (tokenBytes[i % tokenBytes.length] ?? 0)
+ */
+const computeIKM = (deviceKeyB64, sessionToken) => {
+  const deviceBytes = Buffer.from(deviceKeyB64, 'base64');
+  const tokenBytes  = Buffer.from(sessionToken, 'utf8');
+  const ikm = Buffer.alloc(32);
+  for (let i = 0; i < 32; i++) {
+    ikm[i] = (deviceBytes[i] ?? 0) ^ (tokenBytes[i % tokenBytes.length] ?? 0);
+  }
+  return ikm;
 };
 
-const decryptPayload = (encryptedPayload, sessionToken) => {
-  const key = deriveKey(sessionToken);
-  const iv = Buffer.from(encryptedPayload.iv, 'base64');
-  const dataWithTag = Buffer.from(encryptedPayload.data, 'base64');
+/** HKDF-SHA-384 key derivation — matches client's deriveRequestKey */
+const hkdfDeriveKey = (ikm, salt, info) => {
+  return new Promise((resolve, reject) => {
+    crypto.hkdf('sha384', ikm, salt, info, 32, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(Buffer.from(derivedKey));
+    });
+  });
+};
 
-  // AES-GCM: auth tag is the last 16 bytes
-  const authTag = dataWithTag.slice(dataWithTag.length - 16);
-  const ciphertext = dataWithTag.slice(0, dataWithTag.length - 16);
+/**
+ * Decrypt payload bundle { v, rid, ts, iv, ct } (base64-encoded JSON)
+ * Matches client's encryptPayload / HKDF_INFO_REQUEST
+ */
+const decryptPayloadV3 = async (payloadB64, deviceKeyB64, sessionToken) => {
+  const bundle = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+  if (bundle.v !== 3) throw new Error('Unsupported payload version: ' + bundle.v);
 
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  const iv  = Buffer.from(bundle.iv, 'base64');  // 12-byte nonce
+  const ct  = Buffer.from(bundle.ct, 'base64');  // ciphertext + 16-byte GCM auth tag
+
+  const ikm        = computeIKM(deviceKeyB64, sessionToken);
+  const aesKey     = await hkdfDeriveKey(ikm, iv, HKDF_INFO_REQUEST);
+
+  const authTag    = ct.slice(ct.length - 16);
+  const ciphertext = ct.slice(0, ct.length - 16);
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, iv);
   decipher.setAuthTag(authTag);
 
   const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(decrypted.toString('utf8'));
 };
 
-const encryptResponse = (data, sessionToken) => {
-  const key = deriveKey(sessionToken);
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(JSON.stringify(data), 'utf8'),
-    cipher.final()
-  ]);
-  const authTag = cipher.getAuthTag();
-  return {
+/**
+ * Encrypt response using HKDF_INFO_RESPONSE, returns base64 bundle string.
+ * Matches client's decryptResponse.
+ */
+const encryptResponseV3 = async (data, deviceKeyB64, sessionToken) => {
+  const iv     = crypto.randomBytes(12);
+  const ikm    = computeIKM(deviceKeyB64, sessionToken);
+  const aesKey = await hkdfDeriveKey(ikm, iv, HKDF_INFO_RESPONSE);
+
+  const cipher    = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
+  const plaintext = Buffer.from(JSON.stringify(data), 'utf8');
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag   = cipher.getAuthTag();
+  const ct        = Buffer.concat([encrypted, authTag]);
+
+  const bundle = {
+    v:  3,
     iv: iv.toString('base64'),
-    data: Buffer.concat([encrypted, authTag]).toString('base64')
+    ct: ct.toString('base64'),
   };
+
+  return Buffer.from(JSON.stringify(bundle)).toString('base64');
 };
 
 // ---- Health check ----
@@ -236,19 +277,16 @@ app.post('/gateway', async (req, res) => {
   log('INFO', '/gateway', 'Incoming gateway request');
   try {
     const authHeader = req.headers.authorization;
-    const { payload: encryptedPayload, sig: signature } = req.body;
+    // Client sends: { payload: payloadB64, sig: signatureB64, dk: deviceKeyB64 }
+    const { payload: payloadB64, sig: signature, dk: deviceKeyB64 } = req.body;
 
-    // Debug: Log what we actually received
-    log('INFO', '/gateway', `Auth header present: ${!!authHeader}`);
-    log('INFO', '/gateway', `Body keys: ${Object.keys(req.body || {}).join(', ')}`);
-    log('INFO', '/gateway', `encryptedPayload present: ${!!encryptedPayload}, type: ${typeof encryptedPayload}`);
-    log('INFO', '/gateway', `signature present: ${!!signature}, type: ${typeof signature}`);
+    log('INFO', '/gateway', `Auth header: ${!!authHeader}, payload: ${!!payloadB64}, sig: ${!!signature}, dk: ${!!deviceKeyB64}`);
 
-    if (!authHeader || !encryptedPayload || !signature) {
-      const missing = [];
-      if (!authHeader) missing.push('authHeader');
-      if (!encryptedPayload) missing.push('payload');
-      if (!signature) missing.push('sig');
+    const missing = [];
+    if (!authHeader)   missing.push('Authorization header');
+    if (!payloadB64)   missing.push('payload');
+    if (!signature)    missing.push('sig');
+    if (missing.length > 0) {
       log('WARNING', '/gateway', `Missing fields: ${missing.join(', ')}`);
       return res.status(400).json({ error: `Bad Request: missing ${missing.join(', ')}` });
     }
@@ -270,53 +308,60 @@ app.post('/gateway', async (req, res) => {
       .single();
 
     if (keyError || !keyData?.public_key) {
-      log('WARNING', '/gateway', `Public key not found for user ${user.id} - keyError: ${keyError?.code}`);
-      return res.status(403).json({ 
-        error: 'Public key not registered', 
+      log('WARNING', '/gateway', `Public key not found for user ${user.id}`);
+      return res.status(403).json({
+        error: 'Public key not registered',
         code: 'KEY_NOT_REGISTERED',
-        message: 'Kunci keamanan belum terdaftar. Silakan logout dan login kembali untuk mendaftarkan kunci baru.'
+        message: 'Kunci keamanan belum terdaftar. Silakan logout dan login kembali.'
       });
     }
 
-    // 3. Verify digital signature of the encrypted payload
+    // 3. Verify RSA-PSS/SHA-512 digital signature
+    //    Client signs the raw payloadB64 *string bytes* — so we verify the same.
     let isSignatureValid = false;
-    
-    // Check if using fallback mode (for non-HTTPS environments like CefSharp)
+
     if (signature === 'FALLBACK_SIGNATURE') {
-      log('WARNING', '/gateway', `User ${user.id} using FALLBACK mode (no Web Crypto API)`);
-      isSignatureValid = true; // Accept fallback in development/non-HTTPS environments
+      log('WARNING', '/gateway', `User ${user.id} using FALLBACK_SIGNATURE mode`);
+      isSignatureValid = true;
     } else {
       try {
-        const verify = crypto.createVerify('sha256');
-        verify.update(JSON.stringify(encryptedPayload));
-        verify.end();
-        isSignatureValid = verify.verify(keyData.public_key, Buffer.from(signature, 'base64'));
+        // RSA-PSS with SHA-512 and saltLength=64 — must match client signPayload()
+        isSignatureValid = crypto.verify(
+          'SHA512',
+          Buffer.from(payloadB64, 'utf8'),  // sign the raw base64 string bytes
+          {
+            key: keyData.public_key,
+            padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+            saltLength: 64,
+          },
+          Buffer.from(signature, 'base64')
+        );
       } catch (verifyErr) {
-        log('ERROR', '/gateway', `Signature verification crashed: ${verifyErr.message}`);
+        log('ERROR', '/gateway', `RSA-PSS verify crashed: ${verifyErr.message}`);
       }
     }
 
     if (!isSignatureValid) {
-      log('WARNING', '/gateway', `Invalid signature for user ${user.id}`);
+      log('WARNING', '/gateway', `Invalid RSA-PSS signature for user ${user.id}`);
       return res.status(401).json({ error: 'Invalid digital signature.' });
     }
 
-    // 4. Decrypt AES-256-GCM payload using session token
+    // 4. Decrypt AES-256-GCM payload (v3 bundle) using HKDF-SHA-384
     let decryptedPayload;
     try {
-      // Check if using fallback encryption
-      if (encryptedPayload.iv === 'fallback') {
-        log('WARNING', '/gateway', 'Using fallback decryption (no AES-GCM)');
-        decryptedPayload = JSON.parse(Buffer.from(encryptedPayload.data, 'base64').toString('utf8'));
+      if (signature === 'FALLBACK_SIGNATURE' || !deviceKeyB64) {
+        // Fallback: payload is plain base64 JSON
+        log('WARNING', '/gateway', 'Fallback decryption (no deviceKey / FALLBACK_SIGNATURE)');
+        decryptedPayload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
       } else {
-        decryptedPayload = decryptPayload(encryptedPayload, token);
+        decryptedPayload = await decryptPayloadV3(payloadB64, deviceKeyB64, token);
       }
     } catch (decryptErr) {
       log('ERROR', '/gateway', `Decryption failed: ${decryptErr.message}`);
-      return res.status(400).json({ error: 'Payload decryption failed.' });
+      return res.status(400).json({ error: 'Payload decryption failed: ' + decryptErr.message });
     }
 
-    log('INFO', '/gateway', `Signature & decryption OK → action='${decryptedPayload.action}' for user=${user.id}`);
+    log('INFO', '/gateway', `OK → action='${decryptedPayload.action}' user=${user.id}`);
 
     // 5. Forward decrypted JSON to Server 2
     const processorResponse = await fetch(`${PROCESSOR_SERVER_URL}/process`, {
@@ -327,25 +372,29 @@ app.post('/gateway', async (req, res) => {
 
     if (!processorResponse.ok) {
       const errBody = await processorResponse.json().catch(() => ({}));
-      log('ERROR', '/gateway', `Server 2 returned ${processorResponse.status}: ${JSON.stringify(errBody)}`);
+      log('ERROR', '/gateway', `Server 2 error ${processorResponse.status}: ${JSON.stringify(errBody)}`);
       return res.status(502).json(errBody);
     }
 
     const processorData = await processorResponse.json();
 
-    // 6. Encrypt the response with AES-256-GCM before sending back
-    let encryptedResponse;
-    if (signature === 'FALLBACK_SIGNATURE') {
-      // Fallback mode - just use base64
-      encryptedResponse = {
+    // 6. Encrypt response with HKDF v3 — matches client decryptResponse()
+    //    Response field is 'payload' (base64 bundle string) — matches api.js check
+    let responsePayload;
+    if (signature === 'FALLBACK_SIGNATURE' || !deviceKeyB64) {
+      // Fallback mode: plain base64 JSON, wrapped in { payload } so client logic still works
+      const fallbackBundle = {
+        v: 3,
         iv: 'fallback',
-        data: Buffer.from(JSON.stringify(processorData)).toString('base64')
+        ct: Buffer.from(JSON.stringify(processorData)).toString('base64')
       };
+      responsePayload = Buffer.from(JSON.stringify(fallbackBundle)).toString('base64');
     } else {
-      encryptedResponse = encryptResponse(processorData, token);
+      responsePayload = await encryptResponseV3(processorData, deviceKeyB64, token);
     }
-    log('INFO', '/gateway', `Response encrypted and returned to client`);
-    res.json({ encryptedData: encryptedResponse });
+
+    log('INFO', '/gateway', `Response encrypted (v3) and returned to client`);
+    res.json({ payload: responsePayload });
 
   } catch (error) {
     log('ERROR', '/gateway', `Unhandled error: ${error.stack}`);
